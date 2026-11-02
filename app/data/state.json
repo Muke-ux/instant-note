@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "notes": [
+    {
+      "id": "1a19c2852f71c62d7a",
+      "text": "英语课文",
+      "done": false,
+      "pinned": false,
+      "cat": "日常",
+      "sub": "",
+      "createdAt": 1793621250807,
+      "order": 5
+    },
+    {
+      "id": "1a19c2864062060289",
+      "text": "模电作业",
+      "done": true,
+      "pinned": true,
+      "cat": "日常",
+      "sub": "",
+      "createdAt": 1793621255174,
+      "order": 0,
+      "doneAt": 1793627614848
+    },
+    {
+      "id": "1a19c28941e3c68d05",
+      "text": "生化论文",
+      "done": true,
+      "pinned": true,
+      "cat": "日常",
+      "sub": "",
+      "createdAt": 1793621267486,
+      "order": 1,
+      "doneAt": 1793627613385
+    },
+    {
+      "id": "1a19c28a4b44a23cee",
+      "text": "影视论文",
+      "done": false,
+      "pinned": true,
+      "cat": "日常",
+      "sub": "",
+      "createdAt": 1793621271732,
+      "order": 2
+    },
+    {
+      "id": "1a19c28b3d857560a6",
+      "text": "大物作业",
+      "done": false,
+      "pinned": false,
+      "cat": "日常",
+      "sub": "",
+      "createdAt": 1793621275608,
+      "order": 6
+    },
+    {
+      "id": "1a19c28c04664e673c",
+      "text": "离散作业",
+      "done": false,
+      "pinned": false,
+      "cat": "日常",
+      "sub": "",
+      "createdAt": 1793621278790,
+      "order": 7
+    },
+    {
+      "id": "1a19c28f4d777636b7",
+      "text": "新生学业指导工作",
+      "done": false,
+      "pinned": true,
+      "cat": "日常",
+      "sub": "",
+      "createdAt": 1793621292247,
+      "order": 3
+    },
+    {
+      "id": "1a19c2918528943fdd",
+      "text": "买秋衣秋裤",
+      "done": false,
+      "pinned": false,
+      "cat": "日常",
+      "sub": "",
+      "createdAt": 1793621301330,
+      "order": 8
+    },
+    {
+      "id": "1a19c2c229b908fbb1",
+      "text": "周四中午12点半学长会议",
+      "done": false,
+      "pinned": false,
+      "cat": "日常",
+      "sub": "",
+      "createdAt": 1793621500571,
+      "order": 4
+    }
+  ],
+  "settings": {
+    "launchAtLogin": true,
+    "overlayOnBoot": false,
+    "overlayOnUnlock": true,
+    "overlayEveryMinutes": 0,
+    "idleAwaySeconds": 150,
+    "monitorAwaySeconds": 0,
+    "theme": "dark",
+    "regionTheme": {
+      "main": "light",
+      "widget": "dark",
+      "overlay": "dark"
+    },
+    "widget": true,
+    "widgetPos": null,
+    "widgetEdgeHide": true,
+    "showDone": false,
+    "widgetCat": "日常",
+    "overlayCat": "日常"
+  },
+  "categories": [
+    {
+      "cat": "日常",
+      "subs": []
+    }
+  ]
+}
