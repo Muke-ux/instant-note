@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import time
+import subprocess
 import ctypes
 import ctypes.wintypes as wt
 import tkinter as tk
@@ -79,16 +80,44 @@ def acquire_single_instance(name=None):
 
 
 def wake_existing():
-    """把已经在跑的那个窗口显示到最前。"""
+    """把已经在跑的那个窗口显示到最前。
+
+    返回 True = 真找到了一个活着的窗口并唤起；
+    返回 False = 没找到（可能是僵尸残留的窗口，或压根没在跑）。
+    """
     try:
         u32 = ctypes.windll.user32
         u32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
         u32.FindWindowW.restype = ctypes.c_void_p
-        # 主窗可能被 ↕ 藏起来，浮窗一般都在，两个都找一下
+        u32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+        u32.IsWindowVisible.restype = ctypes.c_bool
+        u32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p,
+                                                 ctypes.POINTER(ctypes.c_ulong)]
+
         for title in (APP_NAME, "备忘浮窗"):
             hwnd = u32.FindWindowW(None, title)
             if not hwnd:
                 continue
+
+            # 关键：确认这个窗口背后真的还有个活进程。
+            # 见过的情况：进程被强杀后窗口句柄还挂在系统里，
+            # FindWindow 照样找得到，去唤醒它等于什么都没唤醒，
+            # 用户看到的就是"双击了没反应"。
+            pid = ctypes.c_ulong(0)
+            try:
+                u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            except Exception:
+                pid.value = 0
+
+            if pid.value:
+                # 进程还在不在？OpenProcess 失败说明已经没了
+                k32 = ctypes.windll.kernel32
+                k32.OpenProcess.restype = ctypes.c_void_p
+                h = k32.OpenProcess(0x1000, False, pid.value)  # QUERY_LIMITED
+                if not h:
+                    continue                      # 僵尸窗口，跳过
+                k32.CloseHandle(ctypes.c_void_p(h))
+
             SW_SHOW, SW_RESTORE = 5, 9
             u32.ShowWindow(hwnd, SW_RESTORE)
             u32.ShowWindow(hwnd, SW_SHOW)
@@ -98,6 +127,34 @@ def wake_existing():
     except Exception:
         pass
     return False
+
+
+def turn_off_monitor():
+    """立刻关显示器（相当于按显示器的电源键）。
+
+    用 SendMessageTimeoutW 而不是 PostMessage：
+    WM_SYSCOMMAND 得让系统真的处理完，超时给 2 秒，别把界面卡住。
+    """
+    try:
+        u32 = ctypes.windll.user32
+        HWND_BROADCAST = 0xFFFF
+        WM_SYSCOMMAND = 0x0112
+        SC_MONITORPOWER = 0xF170
+        MONITOR_OFF = 2
+        SMTO_ABORTIFHUNG = 0x0002
+        res = ctypes.c_ulong(0)
+        u32.SendMessageTimeoutW(ctypes.c_void_p(HWND_BROADCAST),
+                                WM_SYSCOMMAND,
+                                SC_MONITORPOWER,
+                                MONITOR_OFF,
+                                SMTO_ABORTIFHUNG,
+                                2000,
+                                ctypes.byref(res))
+        return True
+    except Exception as e:
+        print(f"[关屏] 失败: {e}")
+        return False
+
 
 # 熄屏后多少秒弹全屏。默认 0 = 熄屏即弹；用户可以改任意秒数。
 DEFAULT_MONITOR_AWAY = 0
@@ -116,31 +173,108 @@ def monitor_away_threshold(state):
 
 
 # ---------------------------------------------------------------- 数据目录
-APPDATA = os.environ.get("APPDATA", os.path.expanduser("~"))
-_DATA_CANDIDATES = [
-    os.path.join(APPDATA, APP_ID),
-    os.path.join(os.path.expanduser("~"), ".instant-note"),
-    os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "data"),
-]
+# 数据固定放在程序旁边的 app\data —— 绿色版跟着文件夹走，
+# 整个目录拷到别处，备忘也跟着过去。
+#
+# 【为什么不再到处找】
+# 以前按 %APPDATA% → ~/.instant-note → 程序目录 的顺序挑第一个能写的，
+# 结果程序到底读哪儿取决于运行时环境（sys.argv[0] 是谁、APPDATA 是否
+# 可写……），跟人以为的位置对不上，表现就是"我明明改了文件，界面没变"、
+# "数据一会儿在一会儿没"。现在只认一处，没有歧义。
+def _program_dir():
+    """程序根目录（app 的上一级）。
+
+    正常启动时 sys.argv[0] 是 ...\\即时备忘-绿色版\\app\\main.py，
+    取 dirname 两次就是 ...\\即时备忘-绿色版。
+    直接用 python 交互式 import 时退化到本文件的目录。
+    """
+    try:
+        here = os.path.dirname(os.path.abspath(sys.argv[0]))
+        if os.path.basename(here).lower() == "app":
+            return os.path.dirname(here)
+        return here
+    except Exception:
+        return os.path.dirname(os.path.abspath(__file__))
 
 
 def _pick_data_dir():
-    for d in _DATA_CANDIDATES:
+    """数据目录：固定为 程序目录\\app\\data，不挑、不随机。"""
+    root = _program_dir()
+    # 源码目录直接跑（pyapp/main.py）时，落到 pyapp/data，方便调试
+    if os.path.basename(root).lower() == "pyapp":
+        d = os.path.join(root, "data")
+    else:
+        d = os.path.join(root, "app", "data")
+
+    try:
+        os.makedirs(d, exist_ok=True)
+        probe = os.path.join(d, ".write_test")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return d
+    except Exception:
+        # 程序目录不可写（比如放在 Program Files）才退到用户目录，
+        # 且同样用固定名字，绝不随机。
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        d = os.path.join(base, "InstantNote", "data")
         try:
             os.makedirs(d, exist_ok=True)
-            probe = os.path.join(d, ".write_test")
-            with open(probe, "w", encoding="utf-8") as f:
-                f.write("ok")
-            os.remove(probe)
-            return d
         except Exception:
-            continue
-    import tempfile
-    return tempfile.mkdtemp(prefix="instantnote-")
+            pass
+        return d
 
 
 DATA_DIR = _pick_data_dir()
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
+
+
+def _migrate_old_state():
+    """第一次用新路径时，把散落在旧位置的数据搬过来。
+
+    以前数据可能在 %APPDATA%\\InstantNote 或 ~/.instant-note，
+    换成固定 app\\data 之后，老用户第一次启动会看到一个空列表 ——
+    所以这里做一次性迁移：新位置没有 state.json、而旧位置有时，复制过来。
+    只复制，不删旧的，留个后路。
+    """
+    try:
+        if os.path.exists(STATE_FILE):
+            return None                      # 新位置已有，不用管
+        olds = [
+            os.path.join(os.environ.get("APPDATA", ""), APP_ID, "state.json"),
+            os.path.join(os.path.expanduser("~"), ".instant-note", "state.json"),
+        ]
+        for old in olds:
+            if not old or not os.path.exists(old):
+                continue
+            try:
+                with open(old, "rb") as f:
+                    blob = f.read()
+                os.makedirs(DATA_DIR, exist_ok=True)
+                with open(STATE_FILE, "wb") as f:
+                    f.write(blob)
+                return old
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+_migrated_from = _migrate_old_state()
+
+# 启动自检：把实际用的数据目录写进日志文件。
+# pythonw.exe 没有控制台，print 是看不见的，必须落盘。
+try:
+    import io as _io
+    _log = _io.open(os.path.join(DATA_DIR, "datadir.log"), "a", encoding="utf-8")
+    _log.write("%s  DATA_DIR=%s  存在=%s%s\n" % (
+        datetime.now().strftime("%m-%d %H:%M:%S"), DATA_DIR,
+        os.path.exists(STATE_FILE),
+        ("  已从 %s 迁移" % _migrated_from) if _migrated_from else ""))
+    _log.close()
+except Exception:
+    pass
 
 DEFAULT_STATE = {
     "version": 1,
@@ -161,6 +295,8 @@ DEFAULT_STATE = {
         # 浮窗 / 全屏提醒各自只看哪个类，"" = 全部
         "widgetCat": "",
         "overlayCat": "",
+        # Alt+L 一键关显示器（默认关，面板里可以开）
+        "hotkeyDisplayOff": False,
     },
     # 分类表：[{"cat": "工作", "subs": ["周报", "会议"]}, ...]
     "categories": [],
@@ -501,6 +637,13 @@ PBT_POWERSETTINGCHANGE = 0x8013
 GUID_CONSOLE_DISPLAY_STATE = (0x6FE69556, 0x704A, 0x47A0,
                               (0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47))
 
+# 全局热键：RegisterHotKey 注册后，不管焦点在哪个程序都收得到。
+# 消息进 WM_HOTKEY，由隐藏窗口的 wndproc 接。
+WM_HOTKEY = 0x0312
+HOTKEY_ID = 0xB001          # 随便一个本进程内唯一的 id
+MOD_ALT = 0x0001
+VK_L = 0x4C                 # 字母 L 的虚拟键码
+
 LRESULT = ctypes.c_ssize_t
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wt.HWND, wt.UINT,
                              ctypes.c_size_t, ctypes.c_ssize_t)
@@ -614,7 +757,14 @@ class DisplayWatcher:
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def pump(self):
-        """把本线程消息队列里的消息派发掉（tkinter 只处理自己的）。"""
+        """把属于本隐藏窗口的电源广播消息派发掉。
+
+        tkinter 的 mainloop 只泵自己的窗口，这个隐藏窗口的消息
+        得自己取，否则 _wndproc 永远收不到 WM_POWERBROADCAST。
+
+        注意必须传 hwnd 限定范围：不传的话会把 tkinter 自己的
+        消息一起吞掉，之后 tkinter.update() 会崩。
+        """
         if not self.hwnd:
             return
 
@@ -624,11 +774,123 @@ class DisplayWatcher:
                         ("time", wt.DWORD), ("pt", wt.POINT)]
 
         m = MSG()
-        for _ in range(30):
-            if not user32.PeekMessageW(ctypes.byref(m), None, 0, 0, 1):
+        # 每轮最多取 8 条，别把一帧的时间全花在这儿
+        for _ in range(8):
+            got = user32.PeekMessageW(ctypes.byref(m), ctypes.c_void_p(self.hwnd),
+                                      0, 0, 1)      # PM_REMOVE
+            if not got:
                 break
             user32.TranslateMessage(ctypes.byref(m))
             user32.DispatchMessageW(ctypes.byref(m))
+
+
+# ================================================================ 全局热键
+class HotkeyDaemon:
+    """管理外置的 Alt+L 守护进程（hotkey.py）。
+
+    为什么单独拆一个程序？
+    主程序是 tkinter，全局热键的消息必须由窗口过程接；ctypes 挂的
+    窗口过程在 Python 里跑会崩（回调进入时没有线程状态）。拆出去以后
+    它有自己的消息循环，跟 tkinter 彻底分开，谁也不影响谁。
+
+    主程序只负责：
+      - 设置开着  -> 把它拉起来
+      - 设置关掉  -> 让它退出
+      - 主面板按钮 -> 调它关一次屏（--off）
+    """
+
+    def __init__(self):
+        self.proc = None        # 常驻守护进程的 Popen
+        self.enabled = False
+
+    # ---- 找可执行文件
+    @staticmethod
+    def _app_dir():
+        return os.path.dirname(os.path.abspath(__file__))
+
+    @staticmethod
+    def _script():
+        return os.path.join(HotkeyDaemon._app_dir(), "hotkey.py")
+
+    @staticmethod
+    def _runner():
+        """优先用 pythonw.exe（不弹黑框），没有就用当前解释器。"""
+        exe = sys.executable or ""
+        pw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.isfile(pw):
+            return pw
+        return exe
+
+    # ---- 起停
+    def start(self):
+        """拉起常驻守护进程（已经在跑就什么都不做）。"""
+        if not os.path.isfile(self._script()):
+            print("[热键] 找不到 hotkey.py，跳过")
+            return False
+        try:
+            flags = 0
+            if os.name == "nt":
+                flags = 0x00000008 | 0x08000000     # DETACHED_PROCESS | CREATE_NO_WINDOW
+            self.proc = subprocess.Popen(
+                [self._runner(), self._script()],
+                cwd=self._app_dir(), creationflags=flags,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.enabled = True
+            print("[热键] Alt+L 守护进程已启动")
+            return True
+        except Exception as e:
+            print("[热键] 启动守护进程失败", e)
+            return False
+
+    def ensure(self):
+        """确认守护进程活着；已经有一个在跑（比如上次没退干净）也算成功。"""
+        if self._alive():
+            self.enabled = True
+            return True
+        return self.start()
+
+    def _alive(self):
+        p = self.proc
+        return bool(p and p.poll() is None)
+
+    def stop(self):
+        """让守护进程退出，并释放 Alt+L。"""
+        try:
+            if os.path.isfile(self._script()):
+                flags = 0
+                if os.name == "nt":
+                    flags = 0x08000000              # CREATE_NO_WINDOW
+                subprocess.run([self._runner(), self._script(), "--quit"],
+                               cwd=self._app_dir(), creationflags=flags,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=5)
+        except Exception:
+            pass
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+        except Exception:
+            pass
+        self.proc = None
+        self.enabled = False
+        print("[热键] Alt+L 守护进程已停止")
+
+    def off_once(self):
+        """调守护进程关一次显示器（面板按钮走这条）。"""
+        if not os.path.isfile(self._script()):
+            return False
+        try:
+            flags = 0
+            if os.name == "nt":
+                flags = 0x08000000
+            subprocess.Popen([self._runner(), self._script(), "--off"],
+                             cwd=self._app_dir(), creationflags=flags,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            return True
+        except Exception as e:
+            print("[热键] 关屏失败", e)
+            return False
 
 
 # ================================================================ 主窗口
@@ -795,6 +1057,13 @@ class MainWindow(RegionPalette):
         row2.pack(fill="x", padx=S(16), pady=S(3))
         self.s_widget = self._switch(row2, "桌面浮窗", "widget")
         self.s_edge = self._switch(row2, "贴边隐藏", "widgetEdgeHide")
+
+        # Alt+L 关显示器：单独的开关，默认关
+        row2b = tk.Frame(self.set_body, bg=self.BG_SOFT)
+        row2b.pack(fill="x", padx=S(16), pady=S(3))
+        self.s_hotkey = self._switch(row2b, "Alt+L 一键关显示器", "hotkeyDisplayOff")
+        tk.Label(row2b, text="（关掉后 Alt+L 不响应）", bg=self.BG_SOFT,
+                 fg=self.TEXT_FAINT, font=F(11)).pack(side="left")
 
         row3 = tk.Frame(self.set_body, bg=self.BG_SOFT)
         row3.pack(fill="x", padx=S(16), pady=(S(4), S(4)))
@@ -1287,6 +1556,9 @@ class MainWindow(RegionPalette):
             self.app.set_widget(bool(var.get()))
         elif key == "widgetEdgeHide":
             self.app.widget.set_edge_hide(bool(var.get()))
+        elif key == "hotkeyDisplayOff":
+            # 开关一并控制全局热键的注册，关掉后系统层面也不占用 Alt+L
+            self.app.apply_hotkey_state()
 
     def on_every_change(self):
         try:
@@ -1607,9 +1879,9 @@ class OverlayWindow(RegionPalette):
                              font=F(12), anchor="w")
         self.stat.pack(fill="x", pady=(S(20), S(12)))
 
-        self.listframe = tk.Frame(body, bg=self.BG)
-        self.listframe.pack(fill="both", expand=True)
-
+        # ---- 底部按钮区：先 pack 到底部，占好位置
+        # 以前是列表先 expand、按钮后 pack，条目一多列表就把按钮
+        # 挤出屏幕。现在按钮先占住底部，列表只在剩下的空间里滚。
         foot = tk.Frame(body, bg=self.BG)
         foot.pack(fill="x", side="bottom", pady=(S(20), 0))
 
@@ -1635,7 +1907,65 @@ class OverlayWindow(RegionPalette):
               lambda: (self.hide(), self.app.show_main())
               ).pack(side="right", padx=(0, S(12)))
 
+        # ---- 列表区：可滚动，高度吃满剩余空间
+        listwrap = tk.Frame(body, bg=self.BG)
+        listwrap.pack(fill="both", expand=True)
+
+        self.canvas = tk.Canvas(listwrap, bg=self.BG,
+                                highlightthickness=0, bd=0)
+        self.sb = tk.Scrollbar(listwrap, orient="vertical",
+                               command=self.canvas.yview,
+                               bg=self.BG_CARD, troughcolor=self.BG,
+                               borderwidth=0, highlightthickness=0,
+                               width=S(10))
+        self.canvas.configure(yscrollcommand=self._on_scroll_set)
+        self.sb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.listframe = tk.Frame(self.canvas, bg=self.BG)
+        self._win_id = self.canvas.create_window(
+            (0, 0), window=self.listframe, anchor="nw")
+        self.listframe.bind("<Configure>", self._on_frame_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
         return w
+
+    def _on_scroll_set(self, first, last):
+        """内容装得下就藏滚动条。"""
+        try:
+            need = not (float(first) <= 0.0 and float(last) >= 1.0)
+            if need:
+                if not self.sb.winfo_ismapped():
+                    self.sb.pack(side="right", fill="y")
+            else:
+                if self.sb.winfo_ismapped():
+                    self.sb.pack_forget()
+                self.canvas.yview_moveto(0)
+        except Exception:
+            pass
+        self.sb.set(first, last)
+
+    def _on_frame_configure(self, e=None):
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_canvas_configure(self, e):
+        try:
+            self.canvas.itemconfig(self._win_id, width=e.width)
+        except Exception:
+            pass
+
+    def _on_wheel(self, e):
+        try:
+            if not (self.win and self.win.winfo_exists()):
+                return
+            if self.canvas.bbox("all") is None:
+                return
+            self.canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        except Exception:
+            pass
 
     @staticmethod
     def _greet(h):
@@ -1692,7 +2022,7 @@ class OverlayWindow(RegionPalette):
 
             txt = tk.Label(inner, text=n["text"], bg=self.BG_CARD, fg=self.TEXT,
                            font=F(21), justify="left", anchor="w",
-                           wraplength=S(1000))
+                           wraplength=self._wrap_width())
             txt.pack(side="left", fill="x", expand=True, padx=(S(16), 0))
 
             def do_done(e, nid=n["id"], bx=box, tx=txt):
@@ -1709,6 +2039,24 @@ class OverlayWindow(RegionPalette):
 
             box.bind("<Button-1>", do_done)
             txt.bind("<Button-1>", do_done)
+
+        # 列表重建了，滚动区重算并回到顶部
+        self.listframe.update_idletasks()
+        self._on_frame_configure()
+        try:
+            self.canvas.yview_moveto(0)
+        except Exception:
+            pass
+
+    def _wrap_width(self):
+        """按 Canvas 实际宽度算换行宽度。"""
+        try:
+            cw = self.canvas.winfo_width()
+            if cw > 40:
+                return max(S(300), cw - S(90))
+        except Exception:
+            pass
+        return S(1000)
 
     def _fill_cat_chips(self, bar, cur, on_pick, small=False):
         """在 bar 里画一排分类标签：全部 + 各类，单选。
@@ -1757,6 +2105,11 @@ class OverlayWindow(RegionPalette):
             pass
         w.focus_force()
         self.refresh()
+        # 全屏铺满，滚轮直接绑窗口
+        try:
+            w.bind("<MouseWheel>", self._on_wheel)
+        except Exception:
+            pass
 
     def hide(self):
         if self.win and self.win.winfo_exists():
@@ -1779,6 +2132,22 @@ class WidgetWindow(RegionPalette):
         self._full_h = 240
         self._leave_job = None
 
+    def _clamp_pos(self, x, y):
+        """把窗口坐标夹回屏幕内。
+
+        上次保存的位置可能是别的分辨率下拖的，或者干脆拖到了边外，
+        直接拿来用就会有一半窗口看不见 —— 表现就是"启动时错位"。
+        留一点边距，别贴着边缘。
+        """
+        w = self._full_w
+        h = self._full_h
+        margin = 8
+        max_x = max(0, self.app.sw - w - margin)
+        max_y = max(0, self.app.sh - h - margin)
+        x = max(margin, min(int(x), max_x))
+        y = max(0, min(int(y), max_y))
+        return x, y
+
     def build(self):
         self.set_palette('widget')
         if self.win and self.win.winfo_exists():
@@ -1796,7 +2165,11 @@ class WidgetWindow(RegionPalette):
 
         pos = self.app.state["settings"].get("widgetPos")
         if pos:
-            w.geometry(f"{self._full_w}x{self._full_h}+{int(pos['x'])}+{int(pos['y'])}")
+            # 位置是上次存下来的，但屏幕分辨率/缩放可能变过，
+            # 也可能上次拖到了边缘外 —— 这里统一夹回可视区，
+            # 否则启动时窗口会有一半在屏幕外，看着就是"错位"。
+            x, y = self._clamp_pos(int(pos["x"]), int(pos["y"]))
+            w.geometry(f"{self._full_w}x{self._full_h}+{x}+{y}")
         else:
             w.geometry(f"{self._full_w}x{self._full_h}"
                        f"+{self.app.sw - self._full_w - S(30)}"
@@ -1835,6 +2208,14 @@ class WidgetWindow(RegionPalette):
         mainbtn.bind("<Enter>", lambda e: mainbtn.configure(bg=self.ACCENT, fg=self.ON_ACCENT))
         mainbtn.bind("<Leave>", lambda e: mainbtn.configure(bg=self.BG_CARD, fg=self.ACCENT))
 
+        # 一键关屏（跟 Alt+L 同一套逻辑，走外置守护进程）
+        offbtn = tk.Label(head, text="关屏", bg=self.BG_CARD, fg=self.TEXT_DIM,
+                          font=F(11), cursor="hand2", padx=S(7), pady=S(2))
+        offbtn.pack(side="right", padx=(0, S(4)))
+        offbtn.bind("<Button-1>", lambda e: self.app.click_display_off())
+        offbtn.bind("<Enter>", lambda e: offbtn.configure(bg=self.ACCENT, fg=self.ON_ACCENT))
+        offbtn.bind("<Leave>", lambda e: offbtn.configure(bg=self.BG_CARD, fg=self.TEXT_DIM))
+
         # 关闭靠系统标题栏的 ×，这里不再画一个
 
         # 条数徽标
@@ -1848,8 +2229,30 @@ class WidgetWindow(RegionPalette):
         self.filterbar = tk.Frame(card, bg=self.BG_SOFT)
         self.filterbar.pack(fill="x", padx=S(6), pady=(S(4), 0))
 
-        self.listframe = tk.Frame(card, bg=self.BG_SOFT)
-        self.listframe.pack(fill="both", expand=True, padx=S(6), pady=S(6))
+        # ---- 列表（可滚动）
+        # 以前直接往 card 里 pack，条目一多就被下面的输入框挤掉，
+        # 长条目换行后更明显。改成 Canvas 装，条目再多也能滚。
+        listwrap = tk.Frame(card, bg=self.BG_SOFT)
+        listwrap.pack(fill="both", expand=True, padx=S(6), pady=S(6))
+
+        self.canvas = tk.Canvas(listwrap, bg=self.BG_SOFT,
+                                highlightthickness=0, bd=0)
+        self.sb = tk.Scrollbar(listwrap, orient="vertical",
+                               command=self.canvas.yview,
+                               bg=self.BG_CARD, troughcolor=self.BG_SOFT,
+                               borderwidth=0, highlightthickness=0,
+                               width=S(7))
+        self.canvas.configure(yscrollcommand=self._on_scroll_set)
+        # 浮窗窄，滚动条一隐一现会让内容宽度来回跳，干脆常驻；
+        # 有条在，也等于告诉用户"下面还有"。
+        self.sb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.listframe = tk.Frame(self.canvas, bg=self.BG_SOFT)
+        self._win_id = self.canvas.create_window(
+            (0, 0), window=self.listframe, anchor="nw")
+        self.listframe.bind("<Configure>", self._on_frame_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
 
         # ---- 快速添加
         tk.Frame(card, bg=self.LINE, height=1).pack(fill="x")
@@ -2076,19 +2479,21 @@ class WidgetWindow(RegionPalette):
                      font=F(12)).pack(expand=True, pady=S(30))
             return
 
-        for n in notes[:8]:
+        for n in notes:
             row = tk.Frame(self.listframe, bg=self.BG_SOFT)
             row.pack(fill="x", pady=S(1))
-
             box = tk.Label(row, text="✓", width=2, bg=self.BG_SOFT, fg=self.TEXT_FAINT,
                            font=F(10), cursor="hand2",
                            relief="solid", borderwidth=1)
             box.pack(side="left", anchor="n", pady=(S(2), 0))
 
+            # wraplength 按实际可用宽度算，不能写死 200：
+            # 写死的话长条目换行后行数比预估多，底部就被切掉。
+            wrap = self._wrap_width()
             txt = tk.Label(row, text=n["text"], bg=self.BG_SOFT,
                            fg=self.ACCENT if n.get("pinned") else self.TEXT,
                            font=F(12), justify="left", anchor="w",
-                           wraplength=S(200))
+                           wraplength=wrap)
             txt.pack(side="left", fill="x", expand=True, padx=(S(7), 0))
 
             # 分类小标签，贴在右边
@@ -2113,6 +2518,115 @@ class WidgetWindow(RegionPalette):
             txt.bind("<Button-1>", do_done)
             txt.bind("<Double-Button-1>", lambda e: self.app.show_main())
 
+        # 条目变了，滚动区跟着重算，并回到顶部
+        self.listframe.update_idletasks()
+        self._on_frame_configure()
+        try:
+            self.canvas.yview_moveto(0)
+        except Exception:
+            pass
+
+    def _wrap_width(self):
+        """算出文字标签能用的换行宽度（像素）。
+
+        拿 Canvas 实际宽度减去：勾选框、右边距、分类标签的余量。
+        量不到就退回一个保守值。
+        """
+        try:
+            cw = self.canvas.winfo_width()
+            if cw > 20:
+                return max(S(120), cw - S(46))
+        except Exception:
+            pass
+        return S(200)
+
+    def _on_scroll_set(self, first, last):
+        """浮窗的滚动条常驻，这里只把位置同步给它。
+
+        早先试过"装得下就自动隐藏"，但浮窗宽度只有 300 出头，
+        滚动条一进一出会让标签换行宽度跟着变，内容高度又变，
+        反而来回抖。常驻最省心。
+        """
+        sb = getattr(self, "sb", None)
+        if sb is None:
+            return
+        try:
+            sb.set(first, last)
+        except Exception:
+            pass
+
+    def _on_frame_configure(self, e=None):
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_canvas_configure(self, e):
+        # 让内部 Frame 始终跟 Canvas 一样宽，wraplength 才准
+        try:
+            self.canvas.itemconfig(self._win_id, width=e.width)
+        except Exception:
+            pass
+
+    def _on_wheel(self, e):
+        """只在鼠标停在浮窗上时才滚，别抢别处的滚轮。"""
+        try:
+            if not (self.win and self.win.winfo_exists()):
+                return
+            if self._collapsed:
+                return
+            px, py = self.win.winfo_pointerxy()
+            rx, ry = self.win.winfo_rootx(), self.win.winfo_rooty()
+            if not (rx <= px <= rx + self.win.winfo_width()
+                    and ry <= py <= ry + self.win.winfo_height()):
+                return
+            if self.canvas.bbox("all") is None:
+                return
+            self.canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        except Exception:
+            pass
+
+    def _fit_height(self):
+        """按列表内容把浮窗高度撑到刚好。
+
+        以前高度写死 S(240)，8 条备忘根本装不下，底下几条被切掉，
+        看上去就像"错位"。现在列表装进 Canvas 了，winfo_reqheight
+        不再反映内容（Canvas 请求高度是固定的），得按内容实测。
+
+        撑到「内容刚好装下」和「屏幕最多能放」两者取小：
+        条目不多就紧贴内容，多了就停在屏幕高度上让滚动条接手。
+        """
+        try:
+            w = self.win
+            if not w or not w.winfo_exists() or self._collapsed:
+                return
+            w.update_idletasks()
+
+            # 除列表外的固定部分（标题栏 + 筛选条 + 输入框 + 各道分隔线）
+            chrome = w.winfo_height() - self.canvas.winfo_height()
+            if chrome < 0:
+                chrome = 0
+
+            # 列表内容实际需要的高度
+            bbox = self.canvas.bbox("all")
+            content = (bbox[3] - bbox[1]) if bbox else 0
+            content += S(14)          # 上下内边距
+
+            need = chrome + content
+            # 别超过屏幕，留出任务栏
+            need = min(need, self.app.sh - S(80))
+            if need < S(120):
+                need = S(120)
+            if abs(need - w.winfo_height()) < 2:
+                return
+            x, y = w.winfo_x(), w.winfo_y()
+            # 底边如果会超出屏幕，整块往上挪，别让它飘出去
+            if y + need > self.app.sh:
+                y = max(0, self.app.sh - need)
+            w.geometry(f"{w.winfo_width()}x{need}+{x}+{y}")
+        except Exception:
+            pass
+
     def show(self):
         w = self.build()
         w.deiconify()
@@ -2125,6 +2639,13 @@ class WidgetWindow(RegionPalette):
         except Exception:
             pass
         self.refresh()
+        # 内容排完再定高度，顺序不能反
+        self._fit_height()
+        # 滚轮绑在窗口上（不用 bind_all，免得抢别的窗口）
+        try:
+            w.bind("<MouseWheel>", self._on_wheel)
+        except Exception:
+            pass
 
     def hide(self):
         if self.win and self.win.winfo_exists():
@@ -2175,11 +2696,20 @@ class App:
         self._next_remind = None
         self._display_off_at = None    # 显示器关闭的时刻
         self._pending_pop = False      # 等显示器亮了再弹
+        self._manual_off_until = 0     # 手动关屏的保护窗口截止时刻
 
         # 显示器开关监听（唯一可靠的熄屏信号）
         self.display = DisplayWatcher(on_change=self._on_display_change)
         self._display_ok = self.display.start()
         print(f"[显示器监听] {'已启动' if self._display_ok else '不可用，退回空闲时间判断'}")
+
+        # 全局 Alt+L：交给外置守护进程（hotkey.py）
+        self.hotkey = HotkeyDaemon()
+        # 开机自启也走这里：设置开着就把守护进程带起来，关着就保证它别在
+        self.apply_hotkey_state()
+
+        # 根窗口上也挂一份（本程序窗口有焦点时走这条，双保险）
+        self.bind_hotkey(self.root)
 
     # ---- 转发
     def show_main(self):
@@ -2208,6 +2738,120 @@ class App:
         else:
             if self.widget.win and self.widget.win.winfo_exists():
                 self.widget.win.withdraw()
+
+    # ---- Alt+L 关显示器
+    def _only_power_off(self):
+        """熄灭显示器（Alt+L / 面板「关屏」按钮走这里）。
+
+        两个要注意的点：
+
+        1) **不能**把 _display_off_at 置空。
+           关屏之后系统照常发 GUID_CONSOLE_DISPLAY_STATE，
+           tick() 要靠 _display_off_at 起算"熄屏多久了"，
+           清掉的话计时永远起不来，全屏提醒就等于废了。
+
+        2) 冷静期取 3 秒，不长不短：
+           - 够长：盖住"Alt 松开被当成唤醒 → 屏亮 → 又灭"的那一下，
+             这段时间不弹，闪屏就断了；
+           - 够短：3 秒之后正常熄屏提醒就该接管。以前设 30 秒，
+             用户按完 Alt+L 后半小时内系统再熄屏都不弹，
+             等于把提醒功能关掉了。
+        """
+        now = time.time()
+        if now - getattr(self, "_last_off_call", 0) < 1.2:
+            return
+        self._last_off_call = now
+        self._manual_off_until = now + 3.0
+        # 不碰 _display_off_at：熄屏信号由 _on_display_change 正常写入，
+        # 只是 tick() 在冷静期内不拿它来弹窗。
+        if self.hotkey:
+            self.hotkey.off_once()
+
+    def _do_display_off(self):
+        """按 Alt+L 关一次屏（面板按钮也走这里）。"""
+        if not self.state["settings"].get("hotkeyDisplayOff"):
+            return
+        self._only_power_off()
+
+    def _is_manual_off(self):
+        """这次熄屏是不是"用户按 Alt+L 造成的"。
+
+        只在很窄的条件下返回 True，别的都用正常熄屏提醒逻辑：
+
+          1) 30 秒冷静期内：是刚按完 Alt+L 的那一下，
+             系统还可能把 Alt 松开当唤醒、屏黑了一下又亮，
+             这期间不弹，避免闪。
+          2) 冷静期外，一律 False —— 让熄屏提醒正常工作。
+
+        【之前错在哪】
+        上一版在冷静期之后还加了一条"屏黑着 + idle<120 就继续算手动"，
+        看似贴心，实则把正常场景全吞了：
+          - 你手动关显示器去看书，人还在电脑前（idle 小）
+          - 或者系统设了 5 分钟自动熄屏，你人还坐着
+        这两种都会命中"屏黑 + idle 小"，于是永远不弹全屏提醒。
+        用户看到的就是"熄屏后没有全屏提醒了"。
+        """
+        now = time.time()
+        return now < getattr(self, "_manual_off_until", 0)
+
+    def on_hotkey_display_off(self, event=None):
+        """Alt+L：直接关显示器。
+
+        开关在面板里，关着就什么都不做（但要把事件吃掉，
+        免得 Alt+L 漏到别的程序里触发别的功能）。
+
+        要点：关屏前先立个"这次是我自己关的"标记，
+        否则 tick() 会把它当成"你离开电脑了"，到点弹全屏，
+        全屏一建出来屏幕又亮了 —— 就成了"关一会儿又亮"。
+        """
+        if not self.state["settings"].get("hotkeyDisplayOff"):
+            return "break"
+        self._do_display_off()
+        return "break"
+
+    def hotkey_enabled(self):
+        return bool(self.state["settings"].get("hotkeyDisplayOff"))
+
+    def click_display_off(self):
+        """面板上的"关屏"按钮。
+
+        不跟 Alt+L 的开关绑：就算把全局热键关了，按钮也该能用。
+        """
+        self._only_power_off()
+
+    def apply_hotkey_state(self):
+        """按设置拉起 / 停掉外置的 Alt+L 守护进程。
+
+        开机自启时也会走一遍这个判断：设置开着就把守护进程带起来，
+        关着就保证它不在后台占着 Alt+L。
+        """
+        if not self.hotkey:
+            return
+        try:
+            if self.hotkey_enabled():
+                self.hotkey.ensure()
+            else:
+                self.hotkey.stop()
+        except Exception as e:
+            print("[热键] 同步开关失败", e)
+
+    def bind_hotkey(self, widget):
+        """给窗口挂上 Alt+L（本程序有焦点时走这条）。
+
+        注意两点，都踩过：
+        1) bind_all 是**全局**绑定，不是"这个窗口专属"。每调一次就多
+           一份处理函数，三个窗口各调一次 = 按一下触发三下，正好是
+           "屏幕一闪一闪"的来源之一。所以只绑一次，绑过就跳过。
+        2) 键名 <Alt-l> 和 <Alt-L> 都要绑，但底层是同一个事件，
+           重复绑会重复触发；用一个标志位挡住。
+        """
+        if getattr(self, "_hotkey_bound", False):
+            return
+        try:
+            widget.bind_all("<Alt-l>", self.on_hotkey_display_off)
+            self._hotkey_bound = True
+        except Exception as e:
+            print(f"[快捷键] 绑定失败: {e}")
 
     def region_theme(self, region):
         return self.state["settings"].get("regionTheme", {}).get(region, "dark")
@@ -2361,6 +3005,13 @@ class App:
         except Exception:
             pass
 
+        # 顺手把外置的 Alt+L 守护进程也收掉，别留个孤儿占着热键
+        try:
+            if self.hotkey:
+                self.hotkey.stop()
+        except Exception:
+            pass
+
         # 关窗口（浮窗、全屏、主窗）
         for holder in (self.widget, self.overlay, self.main):
             try:
@@ -2432,13 +3083,14 @@ class App:
                 self._display_off_at = None
                 self._away_while_off = False
             else:
+                # 熄屏统一从这一刻开始计时，手动关屏也一样。
+                # "手动关屏不弹"这件事交给 tick() 里那个几秒的
+                # 保护窗口去处理，不能在这里把计时抹掉。
                 if self._display_off_at is None:
                     self._display_off_at = now
                     self._away_while_off = False
                     # 只记时间，弹不弹由主循环按阈值决定
                 self._display_confirmed_off = True
-        except Exception as e:
-            print("[display]", e)
         except Exception as e:
             print("[display]", e)
 
@@ -2465,10 +3117,26 @@ class App:
             # 关屏那一刻开始计时，熬够阈值就铺全屏。
             # 阈值 0 = 熄屏即弹；调到 60 = 熄屏 1 分钟后才弹。
             # 关屏期间屏是黑的，弹在那儿也不打扰人，屏一亮就在眼前。
+            #
+            # 例外：用户自己按 Alt+L 关的屏不弹 —— 那时人就在电脑前，
+            # 弹全屏反而把屏幕唤醒，观感就是"关一会儿又亮了"。
+            #
+            # 【闪屏的根】
+            # 早先"手动关屏"只护 2.5 秒，过后如果屏还黑着、阈值又是 0，
+            # tick 就铺全屏 -> 全屏创建把屏幕点亮 -> 收到"屏已亮"清掉计时
+            # -> 再熄屏又弹 -> 又亮…… 于是屏幕黑一下亮一下，停不下来。
+            #
+            # 解决办法是给手动关屏一个 3 秒冷静期：这一下（以及它引起的
+            # "亮-灭"抖动）不弹。3 秒之后就交还给正常熄屏提醒，
+            # 否则会反过来把提醒功能吞掉。
             should_pop = False
             threshold = monitor_away_threshold(self.state)
 
-            if monitor_off and not self._away_while_off and off_dur >= threshold:
+            if self._is_manual_off():
+                # 刚按完 Alt+L 的 3 秒：不弹，也不累积"人去楼空"状态
+                self._away_while_off = False
+                self._pending_pop = False
+            elif monitor_off and not self._away_while_off and off_dur >= threshold:
                 self._away_while_off = True
                 self._pending_pop = True
 
@@ -2556,9 +3224,18 @@ def main():
 
     # 只能有一个在跑：开机自启尤其要挡住重复启动
     if not acquire_single_instance():
-        wake_existing()
-        print("[即时备忘] 已经有一个在运行了")
-        sys.exit(0)
+        # 有锁，但得确认背后真有活窗口。见 wake_existing 的注释：
+        # 进程被强杀后互斥量和窗口句柄都可能残留，这时如果直接退出，
+        # 用户双击就是"没反应"。所以——
+        #   有活的窗口 -> 唤起来，本进程退出（正常单实例行为）
+        #   全是僵尸   -> 本进程接管，正常启动
+        if wake_existing():
+            print("[即时备忘] 已经有一个在运行了")
+            sys.exit(0)
+        print("[即时备忘] 检测到残留实例，本进程接管启动")
+        # 僵尸的互斥量句柄已经没人持有，系统会标记为 abandoned，
+        # 但名字还被占着。这里不去硬删它（可能误伤），
+        # 直接往下走 —— 后面的窗口创建不依赖这把锁。
 
     try:
         app = App()

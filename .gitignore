@@ -1,0 +1,18 @@
+# 私有数据 —— 用户的备忘内容不进版本库
+app/data/state.json
+app/data/*.log
+app/data/datadir.log
+
+# Python 运行时产物
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行时临时文件
+app/.hotkey-last
+app/.hotkey-quit
+
+# 系统杂项
+Thumbs.db
+desktop.ini
+.DS_Store
